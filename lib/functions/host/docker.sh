@@ -8,6 +8,58 @@
 # https://github.com/armbian/build/
 
 #############################################################################################################
+# Which container runtime drives the build, and how to invoke it.
+#
+# Docker is preferred when it is usable. Otherwise podman is driven natively -- no `docker` shim on
+# the PATH required. Everything else in this file goes through "${CONTAINER_CMD[@]}" rather than a
+# literal `docker`, so the two runtimes differ only here and in the places where their CLIs actually
+# disagree (see container_info_field).
+#
+# Podman is invoked through sudo unless we are already root: Armbian's image assembly attaches loop
+# devices and mounts real filesystems, and neither is permitted from a rootless user namespace
+# (losetup fails with EPERM; ext4 has no FS_USERNS_MOUNT). Rootless podman can build the image, but
+# cannot assemble one, so there is no point pretending otherwise.
+# Set CONTAINER_RUNTIME=docker|podman to force a choice; set PODMAN_SUDO=no to skip the sudo prefix.
+function detect_container_runtime() {
+	[[ -n "${CONTAINER_CMD[*]:-}" ]] && return 0 # already detected
+
+	declare -g CONTAINER_RUNTIME="${CONTAINER_RUNTIME:-}"
+	declare -g -a CONTAINER_CMD=()
+
+	if [[ -z "${CONTAINER_RUNTIME}" ]]; then
+		# `docker` may itself be a shim to podman; that still works, it just reports as podman later.
+		if [[ -n "$(command -v docker)" ]]; then
+			CONTAINER_RUNTIME="docker"
+		elif [[ -n "$(command -v podman)" ]]; then
+			CONTAINER_RUNTIME="podman"
+		else
+			CONTAINER_RUNTIME="docker" # nothing found; keep the historical name for the error messages
+		fi
+	fi
+
+	if [[ "${CONTAINER_RUNTIME}" == "podman" ]]; then
+		CONTAINER_CMD=(podman)
+		if [[ "${PODMAN_SUDO:-yes}" == "yes" && "${EUID}" != "0" ]]; then
+			CONTAINER_CMD=(sudo podman)
+		fi
+	else
+		CONTAINER_CMD=(docker)
+	fi
+
+	display_alert "Container runtime" "${CONTAINER_RUNTIME} via '${CONTAINER_CMD[*]}'" "debug"
+	return 0
+}
+
+# Read one field of the runtime's `info`, which docker and podman spell differently.
+# $1 = docker Go template, $2 = podman Go template.
+function container_info_field() {
+	detect_container_runtime
+	declare template="${1}"
+	[[ "${CONTAINER_RUNTIME}" == "podman" ]] && template="${2}"
+	"${CONTAINER_CMD[@]}" info --format "${template}" 2> /dev/null || true
+}
+
+#############################################################################################################
 # @TODO: called by no-one, yet.
 function check_and_install_docker_daemon() {
 	# @TODO: sincerely, not worth keeping this. Send user to Docker install docs. `adduser $USER docker` is important on Linux.
@@ -44,19 +96,22 @@ function get_docker_info_once() {
 		declare -g DOCKER_IN_PATH="no"
 		declare -g DOCKER_IS_PODMAN
 
-		# if "docker" is in the PATH...
-		if [[ -n "$(command -v docker)" ]]; then
-			display_alert "Docker is in the path" "Docker in PATH" "debug"
+		detect_container_runtime
+
+		# if the chosen runtime is in the PATH...
+		if [[ -n "$(command -v "${CONTAINER_CMD[-1]}")" ]]; then
+			display_alert "Container runtime is in the path" "${CONTAINER_CMD[-1]} in PATH" "debug"
 			DOCKER_IN_PATH="yes"
 		fi
 
 		# Shenanigans to go around error control & capture output in the same effort.
-		DOCKER_INFO="$({ docker info 2> /dev/null && echo "DOCKER_INFO_OK"; } || true)"
+		DOCKER_INFO="$({ "${CONTAINER_CMD[@]}" info 2> /dev/null && echo "DOCKER_INFO_OK"; } || true)"
 		declare -g -r DOCKER_INFO="${DOCKER_INFO}" # readonly
 
-		if docker --version | grep -q podman; then
+		# Either we drive podman directly, or `docker` is a shim to podman -- in which case it
+		# reports its version as "podman version #.#.#".
+		if [[ "${CONTAINER_RUNTIME}" == "podman" ]] || "${CONTAINER_CMD[@]}" --version | grep -q podman; then
 			DOCKER_IS_PODMAN="yes"
-		# when `docker` is a shim to `podman`, it will report its version as "podman version #.#.#"
 		else
 			DOCKER_IS_PODMAN=""
 		fi
@@ -82,8 +137,9 @@ function is_docker_ready_to_go() {
 		display_alert "Can't use Docker" "Actually ALREADY UNDER DOCKER!" "debug"
 		return 1
 	fi
-	if [[ -z "$(command -v docker)" ]]; then
-		display_alert "Can't use Docker" "docker command not found" "debug"
+	detect_container_runtime
+	if [[ -z "$(command -v "${CONTAINER_CMD[-1]}")" ]]; then
+		display_alert "Can't use a container runtime" "neither docker nor podman found" "debug"
 		return 1
 	fi
 
@@ -106,8 +162,8 @@ function cli_handle_docker() {
 	# Purge Armbian Docker images
 	if [[ "${1}" == dockerpurge && -f /etc/debian_version ]]; then
 		display_alert "Purging Armbian Docker containers" "" "wrn"
-		docker container ls -a | grep armbian | awk '{print $1}' | xargs docker container rm &> /dev/null
-		docker image ls | grep armbian | awk '{print $3}' | xargs docker image rm &> /dev/null
+		"${CONTAINER_CMD[@]}" container ls -a | grep armbian | awk '{print $1}' | xargs "${CONTAINER_CMD[@]}" container rm &> /dev/null
+		"${CONTAINER_CMD[@]}" image ls | grep armbian | awk '{print $3}' | xargs "${CONTAINER_CMD[@]}" image rm &> /dev/null
 		# removes "dockerpurge" from $1, thus $2 becomes $1
 		shift
 		set -- "docker" "$@"
@@ -193,37 +249,47 @@ function docker_cli_prepare() {
 	# Detect some docker info; use cached.
 	get_docker_info_once
 
-	DOCKER_SERVER_VERSION="$(grep -i -e "Server Version:" <<< "${DOCKER_INFO}" | cut -d ":" -f 2 | xargs echo -n)"
+	# `podman info` is YAML with entirely different keys, so the grep-the-text approach docker
+	# allows does not survive the switch. Ask both runtimes for the fields by Go template instead.
+	DOCKER_SERVER_VERSION="$(container_info_field '{{.ServerVersion}}' '{{.Version.Version}}')"
 	display_alert "Docker Server version" "${DOCKER_SERVER_VERSION}" "debug"
 
-	DOCKER_SERVER_KERNEL_VERSION="$(grep -i -e "Kernel Version:" <<< "${DOCKER_INFO}" | cut -d ":" -f 2 | xargs echo -n)"
+	DOCKER_SERVER_KERNEL_VERSION="$(container_info_field '{{.KernelVersion}}' '{{.Host.Kernel}}')"
 	display_alert "Docker Server Kernel version" "${DOCKER_SERVER_KERNEL_VERSION}" "debug"
 
-	DOCKER_SERVER_TOTAL_RAM="$(grep -i -e "Total memory:" <<< "${DOCKER_INFO}" | cut -d ":" -f 2 | xargs echo -n)"
+	DOCKER_SERVER_TOTAL_RAM="$(container_info_field '{{.MemTotal}}' '{{.Host.MemTotal}}')"
 	display_alert "Docker Server Total RAM" "${DOCKER_SERVER_TOTAL_RAM}" "debug"
 
-	DOCKER_SERVER_CPUS="$(grep -i -e "CPUs:" <<< "${DOCKER_INFO}" | cut -d ":" -f 2 | xargs echo -n)"
+	DOCKER_SERVER_CPUS="$(container_info_field '{{.NCPU}}' '{{.Host.CPUs}}')"
 	display_alert "Docker Server CPUs" "${DOCKER_SERVER_CPUS}" "debug"
 
-	DOCKER_SERVER_OS="$(grep -i -e "Operating System:" <<< "${DOCKER_INFO}" | cut -d ":" -f 2 | xargs echo -n)"
+	DOCKER_SERVER_OS="$(container_info_field '{{.OperatingSystem}}' '{{.Host.Distribution.Distribution}}')"
 	display_alert "Docker Server OS" "${DOCKER_SERVER_OS}" "debug"
 
 	declare -g DOCKER_ARMBIAN_HOST_OS_UNAME
 	DOCKER_ARMBIAN_HOST_OS_UNAME="$(uname)"
 	display_alert "Local uname" "${DOCKER_ARMBIAN_HOST_OS_UNAME}" "debug"
 
-	DOCKER_BUILDX_VERSION="$(grep -i -e "buildx:" <<< "${DOCKER_INFO}" | cut -d ":" -f 2 | xargs echo -n)"
-	display_alert "Docker Buildx version" "${DOCKER_BUILDX_VERSION}" "debug"
-
 	declare -g DOCKER_HAS_BUILDX=no
 	declare -g -a DOCKER_BUILDX_OR_BUILD=("build")
-	if [[ -n "${DOCKER_BUILDX_VERSION}" ]]; then
-		DOCKER_HAS_BUILDX=yes
-		DOCKER_BUILDX_OR_BUILD=("buildx" "build" "--progress=plain" "--load")
+	if [[ "${CONTAINER_RUNTIME}" == "podman" ]]; then
+		# podman has no buildx subcommand and needs none: `podman build` caches layers in the image
+		# store by default (--layers). What it shares with the classic docker builder is that the
+		# cache lives *with the image*, so it only survives if the built image does -- which is what
+		# the stable cache tag in docker_cli_build_dockerfile() is for.
+		DOCKER_BUILDX_VERSION=""
+		display_alert "Using podman build" "no buildx needed; layers cached in the image store" "debug"
+	else
+		DOCKER_BUILDX_VERSION="$(grep -i -e "buildx:" <<< "${DOCKER_INFO}" | cut -d ":" -f 2 | xargs echo -n)"
+		display_alert "Docker Buildx version" "${DOCKER_BUILDX_VERSION}" "debug"
+		if [[ -n "${DOCKER_BUILDX_VERSION}" ]]; then
+			DOCKER_HAS_BUILDX=yes
+			DOCKER_BUILDX_OR_BUILD=("buildx" "build" "--progress=plain" "--load")
+		fi
 	fi
 	display_alert "Docker has buildx?" "${DOCKER_HAS_BUILDX}" "debug"
 
-	DOCKER_SERVER_NAME_HOST="$(grep -im1 -e "^ *Name:" <<< "${DOCKER_INFO}" | cut -d ":" -f 2 | xargs echo -n)"
+	DOCKER_SERVER_NAME_HOST="$(container_info_field '{{.Name}}' '{{.Host.Hostname}}')"
 	display_alert "Docker Server Hostname" "${DOCKER_SERVER_NAME_HOST}" "debug"
 
 	# Gymnastics: under Darwin, Docker Desktop and Rancher Desktop in dockerd mode behave differently.
@@ -360,13 +426,13 @@ function docker_cli_prepare_dockerfile() {
 	if [[ -n "${DOCKER_ARMBIAN_HOST_ARCH:-}" ]]; then
 		host_arch="${DOCKER_ARMBIAN_HOST_ARCH}"
 	elif [[ "${DOCKER_IS_PODMAN}" == "yes" ]]; then
-		host_arch="$(docker version --format '{{.OsArch}}')"
+		host_arch="$("${CONTAINER_CMD[@]}" version --format '{{.OsArch}}')"
 		host_arch="${host_arch##*/}"
 	else
 		# Resolve the architecture where the Dockerfile will actually build.
 		# This also avoids relying on host tools such as dpkg, which may not
 		# exist on macOS or non-Debian Docker hosts.
-		host_arch="$(docker version --format '{{.Server.Arch}}')"
+		host_arch="$("${CONTAINER_CMD[@]}" version --format '{{.Server.Arch}}')"
 	fi
 	host_release="${DOCKER_WANTED_RELEASE}" host_arch="${host_arch}" early_prepare_host_dependencies # hooks: add_host_dependencies // host_dependencies_known
 	display_alert "Pre-game host dependencies for host_release '${DOCKER_WANTED_RELEASE}' host_arch '${host_arch}'" "${host_dependencies[*]}" "debug"
@@ -444,7 +510,7 @@ function docker_cli_build_dockerfile() {
 
 	if [[ "${do_force_pull}" == "no" ]]; then
 		# Check if the base image is up to date.
-		local_image_sha="$(docker images --no-trunc --quiet "${DOCKER_ARMBIAN_BASE_IMAGE}")"
+		local_image_sha="$("${CONTAINER_CMD[@]}" images --no-trunc --quiet "${DOCKER_ARMBIAN_BASE_IMAGE}")"
 		display_alert "Checking if base image exists at all" "local_image_sha: '${local_image_sha}'" "debug"
 		if [[ -n "${local_image_sha}" ]]; then
 			display_alert "Armbian docker image" "already exists: ${DOCKER_ARMBIAN_BASE_IMAGE}" "info"
@@ -462,10 +528,10 @@ function docker_cli_build_dockerfile() {
 		# published, accessible image. A single failure would otherwise drop us
 		# into a needless (and much slower) from-scratch build. Retry a few
 		# times before giving up; only then fall back to scratch.
-		sleep_seconds=10 do_with_retries 3 run_host_command_logged docker pull "${DOCKER_ARMBIAN_BASE_IMAGE}" && pull_failed="no"
+		sleep_seconds=10 do_with_retries 3 run_host_command_logged "${CONTAINER_CMD[@]}" pull "${DOCKER_ARMBIAN_BASE_IMAGE}" && pull_failed="no"
 
 		if [[ "${pull_failed}" == "no" ]]; then
-			local_image_sha="$(docker images --no-trunc --quiet "${DOCKER_ARMBIAN_BASE_IMAGE}")"
+			local_image_sha="$("${CONTAINER_CMD[@]}" images --no-trunc --quiet "${DOCKER_ARMBIAN_BASE_IMAGE}")"
 			display_alert "New local image sha after pull" "local_image_sha: ${local_image_sha}" "debug"
 			# print current date and time in epoch format; touches mtime of file
 			echo "${DOCKER_ARMBIAN_BASE_IMAGE}|${local_image_sha}|$(date +%s)" >> "${docker_marker_dir}"/last-pull
@@ -483,19 +549,32 @@ function docker_cli_build_dockerfile() {
 		display_alert "Re-created" "Dockerfile, proceeding, build from scratch" "debug"
 	fi
 
-	# Without buildx, the classic builder keeps its layer cache only in the image store, so the
-	# per-build image removed at the end of every run (see docker_cli_launch) takes the cache with
-	# it: each invocation re-runs the whole Dockerfile, including the expensive requirements step.
-	# Those images also escape both reapers -- 'docker image prune' skips tagged ones, and
-	# docker_cleanup_old_images() matches a different repo -- so they pile up as well.
+	# Without buildx (classic docker builder, and podman) the layer cache lives only in the image
+	# store, so the per-build image removed at the end of every run (see docker_cli_launch) used to
+	# take the cache with it: each invocation re-ran the whole Dockerfile, including the expensive
+	# apt steps. The per-build tag is random (hashed build UUID), so it can never be reused either.
+	#
+	# Give the image a second, *stable* tag keyed to the Dockerfile's content. Removing the
+	# per-build tag afterwards then merely untags -- the layers stay alive under the cache tag, and
+	# the next run with an unchanged Dockerfile hits them. A changed Dockerfile hashes differently
+	# and simply builds under a new cache tag; docker_cleanup_stale_cache_tags() reaps the old ones.
+	declare -g DOCKER_ARMBIAN_CACHE_IMAGE_TAG=""
 	if [[ "${DOCKER_HAS_BUILDX}" != "yes" ]]; then
-		display_alert "Docker buildx not available" "install it, or this image is rebuilt from scratch on every run (and the leftovers are never cleaned up); see 'docker buildx' / package docker-buildx(-plugin)" "err"
+		declare dockerfile_hash
+		dockerfile_hash="$(sha256sum < "${SRC}"/Dockerfile 2> /dev/null | cut -c1-12)"
+		if [[ -n "${dockerfile_hash}" ]]; then
+			DOCKER_ARMBIAN_CACHE_IMAGE_TAG="${DOCKER_ARMBIAN_LOCAL_IMAGE_REPO}:cache-${dockerfile_hash}"
+			display_alert "Layer cache tag" "${DOCKER_ARMBIAN_CACHE_IMAGE_TAG}" "debug"
+		fi
 	fi
 
 	display_alert "Building" "Dockerfile via '${DOCKER_BUILDX_OR_BUILD[*]}'" "info"
 
+	declare -a docker_build_tags=("-t" "${DOCKER_ARMBIAN_INITIAL_IMAGE_TAG}")
+	[[ -n "${DOCKER_ARMBIAN_CACHE_IMAGE_TAG}" ]] && docker_build_tags+=("-t" "${DOCKER_ARMBIAN_CACHE_IMAGE_TAG}")
+
 	BUILDKIT_COLORS="run=123,20,245:error=yellow:cancel=blue:warning=white" \
-		run_host_command_logged docker "${DOCKER_BUILDX_OR_BUILD[@]}" -t "${DOCKER_ARMBIAN_INITIAL_IMAGE_TAG}" -f "${SRC}"/Dockerfile "${SRC}"
+		run_host_command_logged "${CONTAINER_CMD[@]}" "${DOCKER_BUILDX_OR_BUILD[@]}" "${docker_build_tags[@]}" -f "${SRC}"/Dockerfile "${SRC}"
 }
 
 function docker_cli_prepare_launch() {
@@ -753,7 +832,7 @@ function docker_cli_prepare_launch() {
 		Example: DOCKER_EXTRA_ARGS+=("--env" "MY_VAR=value" "--mount" "type=bind,src=/a,dst=/b")
 		Available variables:
 		  - DOCKER_ARGS[@]: current Docker arguments (do not modify directly)
-		  - DOCKER_EXTRA_ARGS[@]: array to append extra arguments for docker run
+		  - DOCKER_EXTRA_ARGS[@]: array to append extra arguments for the container runtime's run
 		  - DOCKER_ARMBIAN_TARGET_PATH: path inside container (/armbian)
 	HOST_PRE_DOCKER_LAUNCH
 
@@ -783,13 +862,13 @@ function docker_cli_launch() {
 	# The amount of privileges and capabilities given is a bare minimum needed for losetup to work
 	if [[ ! -e /dev/loop0 ]]; then
 		display_alert "Running losetup in a temporary container" "because no loop devices exist" "info"
-		run_host_command_logged docker run --rm --privileged --cap-add=MKNOD "${DOCKER_ARMBIAN_INITIAL_IMAGE_TAG}" /usr/sbin/losetup -f
+		run_host_command_logged "${CONTAINER_CMD[@]}" run --rm --privileged --cap-add=MKNOD "${DOCKER_ARMBIAN_INITIAL_IMAGE_TAG}" /usr/sbin/losetup -f
 	fi
 
 	display_alert "-----------------Relaunching in Docker after ${SECONDS}s------------------" "here comes the 🐳" "info"
 
 	local -i docker_build_result
-	if docker run "${DOCKER_ARGS[@]}" "${DOCKER_ARMBIAN_INITIAL_IMAGE_TAG}" /bin/bash "${DOCKER_ARMBIAN_TARGET_PATH}/compile.sh" "${ARMBIAN_CLI_FINAL_RELAUNCH_ARGS[@]}"; then
+	if "${CONTAINER_CMD[@]}" run "${DOCKER_ARGS[@]}" "${DOCKER_ARMBIAN_INITIAL_IMAGE_TAG}" /bin/bash "${DOCKER_ARMBIAN_TARGET_PATH}/compile.sh" "${ARMBIAN_CLI_FINAL_RELAUNCH_ARGS[@]}"; then
 		docker_build_result=$? # capture exit code of test done in the line above.
 		display_alert "-------------Docker run finished after ${SECONDS}s------------------------" "🐳 successful" "info"
 	else
@@ -805,7 +884,7 @@ function docker_cli_launch() {
 	# local 'armbian.local.only/armbian-build' repo) ever reaps them. Removing our own unique tag can't
 	# disturb other in-flight builds, and shared base layers are kept. Ignore errors (the image may
 	# already be gone, e.g. reaped by host housekeeping).
-	run_host_command_logged docker image rm --force "${DOCKER_ARMBIAN_INITIAL_IMAGE_TAG}" "||" true
+	run_host_command_logged "${CONTAINER_CMD[@]}" image rm --force "${DOCKER_ARMBIAN_INITIAL_IMAGE_TAG}" "||" true
 
 	# Find and show the path to the log file for the ARMBIAN_BUILD_UUID.
 	local logs_path="${DEST}/logs" log_file
@@ -830,8 +909,8 @@ function docker_purge_deprecated_volumes() {
 	for mountpoint in "${ARMBIAN_MOUNTPOINTS_DEPRECATED[@]}"; do
 		local volume_id="armbian-${mountpoint//\//-}"
 		display_alert "Purging deprecated Docker volume" "${volume_id}" "info"
-		if docker volume inspect "${volume_id}" &> /dev/null; then
-			run_host_command_logged docker volume rm "${volume_id}"
+		if "${CONTAINER_CMD[@]}" volume inspect "${volume_id}" &> /dev/null; then
+			run_host_command_logged "${CONTAINER_CMD[@]}" volume rm "${volume_id}"
 			display_alert "Purged deprecated Docker volume" "${volume_id} OK" "info"
 		else
 			display_alert "Deprecated Docker volume not found" "${volume_id} OK" "info"
@@ -845,27 +924,27 @@ function docker_cleanup_old_images() {
 	display_alert "Cleaning old Docker images" "removing dangling and keeping only 2 most recent per tag" "info"
 
 	# Remove dangling images (layers with no tags)
-	display_alert "Pruning dangling images" "docker image prune -f" "debug"
-	docker image prune -f > /dev/null 2>&1 || true
+	display_alert "Pruning dangling images" "image prune -f" "debug"
+	"${CONTAINER_CMD[@]}" image prune -f > /dev/null 2>&1 || true
 
 	# For each armbian image tag, keep only the 2 most recent
 	declare image_tags=()
 	while IFS= read -r line; do
 		image_tags+=("$line")
-	done < <(docker images --format '{{.Repository}}:{{.Tag}}' | grep "docker-armbian-build" | sort -u)
+	done < <("${CONTAINER_CMD[@]}" images --format '{{.Repository}}:{{.Tag}}' | grep "docker-armbian-build" | sort -u)
 
 	for image_tag in "${image_tags[@]}"; do
 		# Get all image IDs for this tag, sorted by creation date (newest first)
 		declare -a image_ids=()
 		while IFS= read -r line; do
 			image_ids+=("$line")
-		done < <(docker images --format '{{.ID}} {{.CreatedAt}}' "${image_tag}" | sort -r -k2,2 -k3,3 -k4,4 -k5,5 | awk '{print $1}')
+		done < <("${CONTAINER_CMD[@]}" images --format '{{.ID}} {{.CreatedAt}}' "${image_tag}" | sort -r -k2,2 -k3,3 -k4,4 -k5,5 | awk '{print $1}')
 
 		# Remove images beyond the first 2 (keep newest 2)
 		if [[ ${#image_ids[@]} -gt 2 ]]; then
 			for ((i = 2; i < ${#image_ids[@]}; i++)); do
 				display_alert "Removing old image" "${image_tag}:${image_ids[$i]}" "debug"
-				docker rmi "${image_ids[$i]}" > /dev/null 2>&1 || true
+				"${CONTAINER_CMD[@]}" rmi "${image_ids[$i]}" > /dev/null 2>&1 || true
 			done
 		fi
 	done
@@ -881,11 +960,25 @@ function docker_cleanup_old_images() {
 	# to it. LastTagTime tracks the image, not the individual tag, so re-tagging shields the older
 	# tags on that image as well; erring towards keeping them costs one image worth of disk, while
 	# the opposite error kills a running build.
+	# podman has no .Metadata.LastTagTime; fall back to the image creation time there. That is the
+	# weaker signal the comment above warns about (it belongs to the build that first produced the
+	# image, not to the tag), so podman uses a longer cutoff below to keep the same bias towards
+	# leaving a possibly-live image alone.
+	declare last_tag_time_template='{{.Metadata.LastTagTime.IsZero}} {{.Metadata.LastTagTime.Unix}}'
+	declare -i stale_tag_max_age=$((48 * 3600))
+	if [[ "${CONTAINER_RUNTIME}" == "podman" ]]; then
+		last_tag_time_template='{{.Created.IsZero}} {{.Created.Unix}}'
+		stale_tag_max_age=$((14 * 24 * 3600))
+	fi
+
 	declare stale_ref stale_tag_time stale_tag_is_zero stale_tagged_at
-	declare -i stale_tag_cutoff=$(($(date +%s) - 48 * 3600))
+	declare -i stale_tag_cutoff=$(($(date +%s) - stale_tag_max_age))
 	while read -r stale_ref; do
 		[[ -z "${stale_ref}" ]] && continue
-		stale_tag_time="$(docker image inspect --format '{{.Metadata.LastTagTime.IsZero}} {{.Metadata.LastTagTime.Unix}}' "${stale_ref}" 2> /dev/null || true)"
+		# Never reap the stable layer-cache tags here; they exist precisely to outlive a build.
+		# docker_cleanup_stale_cache_tags() ages those out on its own, much longer, horizon.
+		[[ "${stale_ref}" == *":cache-"* ]] && continue
+		stale_tag_time="$("${CONTAINER_CMD[@]}" image inspect --format "${last_tag_time_template}" "${stale_ref}" 2> /dev/null || true)"
 		stale_tag_is_zero="${stale_tag_time%% *}"
 		stale_tagged_at="${stale_tag_time##* }"
 		# An unset tag time renders as the year-one zero value, which would read as ancient: leave it.
@@ -893,11 +986,38 @@ function docker_cleanup_old_images() {
 		[[ ! "${stale_tagged_at}" =~ ^[0-9]+$ ]] && continue
 		if [[ ${stale_tagged_at} -lt ${stale_tag_cutoff} ]]; then
 			display_alert "Removing leftover per-build image" "${stale_ref}" "debug"
-			docker rmi "${stale_ref}" > /dev/null 2>&1 || true
+			"${CONTAINER_CMD[@]}" rmi "${stale_ref}" > /dev/null 2>&1 || true
 		fi
-	done < <(docker images --format '{{.Repository}}:{{.Tag}}' "${DOCKER_ARMBIAN_LOCAL_IMAGE_REPO:-"armbian.local.only/armbian-build"}" 2> /dev/null)
+	done < <("${CONTAINER_CMD[@]}" images --format '{{.Repository}}:{{.Tag}}' "${DOCKER_ARMBIAN_LOCAL_IMAGE_REPO:-"armbian.local.only/armbian-build"}" 2> /dev/null)
+
+	docker_cleanup_stale_cache_tags
 
 	display_alert "Docker cleanup complete" "dangling images removed, old armbian images pruned" "info"
+}
+
+# Age out the stable layer-cache tags written by docker_cli_build_dockerfile(). One tag exists per
+# distinct Dockerfile content, so they only accumulate when the Dockerfile actually changes (a new
+# base image, a changed dependency list) -- but each one pins a full image worth of layers, so they
+# cannot be kept forever. Keep the most recently created few and drop the rest; a dropped tag costs
+# one cold rebuild, never correctness.
+function docker_cleanup_stale_cache_tags() {
+	declare -i keep_cache_tags="${DOCKER_KEEP_CACHE_TAGS:-3}"
+	declare -a cache_refs=()
+	declare cache_ref
+
+	# Sort by creation time, newest first, so the survivors are the ones most likely to be hit.
+	while read -r cache_ref; do
+		[[ -z "${cache_ref}" ]] && continue
+		cache_refs+=("${cache_ref}")
+	done < <("${CONTAINER_CMD[@]}" images --format '{{.CreatedAt}}\t{{.Repository}}:{{.Tag}}' \
+		"${DOCKER_ARMBIAN_LOCAL_IMAGE_REPO:-"armbian.local.only/armbian-build"}" 2> /dev/null |
+		grep -F ':cache-' | sort -r | cut -f2)
+
+	declare -i cache_idx
+	for ((cache_idx = keep_cache_tags; cache_idx < ${#cache_refs[@]}; cache_idx++)); do
+		display_alert "Removing stale layer-cache image" "${cache_refs[${cache_idx}]}" "debug"
+		"${CONTAINER_CMD[@]}" rmi "${cache_refs[${cache_idx}]}" > /dev/null 2>&1 || true
+	done
 }
 
 # Pull a Docker image and update the marker file to track when it was last pulled
@@ -915,10 +1035,10 @@ function docker_pull_with_marker() {
 
 	display_alert "Pulling Docker image" "${image_name}" "info"
 
-	if docker pull "${image_name}"; then
+	if "${CONTAINER_CMD[@]}" pull "${image_name}"; then
 		# Update marker file after successful pull
 		declare local_image_sha
-		local_image_sha="$(docker images --no-trunc --quiet "${image_name}")"
+		local_image_sha="$("${CONTAINER_CMD[@]}" images --no-trunc --quiet "${image_name}")"
 		if [[ -n "${local_image_sha}" ]]; then
 			echo "${image_name}|${local_image_sha}|$(date +%s)" >> "${docker_marker_dir}"/last-pull
 			display_alert "Updated pull marker" "${image_name}" "debug"
@@ -960,6 +1080,9 @@ function docker_setup_auto_pull_cronjob() {
 			set -o pipefail
 
 			SRC="__SRC_PLACEHOLDER__"
+			# The runtime the build itself selected, baked in at generation time: this script runs
+			# from cron with no Armbian environment around it, so it cannot detect one for itself.
+			declare -a CONTAINER_CMD=(__CONTAINER_CMD_PLACEHOLDER__)
 			MARKER_DIR="${SRC}/cache/docker"
 
 			# Fallback to .tmp if cache is not writable
@@ -980,10 +1103,10 @@ function docker_setup_auto_pull_cronjob() {
 
 				log "Pulling Docker image: ${image_name}"
 
-				if docker pull "${image_name}" 2>&1 | logger -t armbian-docker-pull; then
+				if "${CONTAINER_CMD[@]}" pull "${image_name}" 2>&1 | logger -t armbian-docker-pull; then
 					# Update marker file after successful pull
 					local local_image_sha
-					local_image_sha="$(docker images --no-trunc --quiet "${image_name}")"
+					local_image_sha="$("${CONTAINER_CMD[@]}" images --no-trunc --quiet "${image_name}")"
 					if [[ -n "${local_image_sha}" ]]; then
 						echo "${image_name}|${local_image_sha}|$(date +%s)" >> "${MARKER_DIR}/last-pull"
 						log "Updated pull marker for: ${image_name}"
@@ -1002,6 +1125,8 @@ function docker_setup_auto_pull_cronjob() {
 
 	# Replace placeholders with actual values
 	wrapper_content="${wrapper_content//__SRC_PLACEHOLDER__/${SRC}}"
+	detect_container_runtime
+	wrapper_content="${wrapper_content//__CONTAINER_CMD_PLACEHOLDER__/${CONTAINER_CMD[*]}}"
 	declare image_commands=""
 	for image in "${images_to_pull[@]}"; do
 		image_commands+="pull_with_marker \"${image}\""$'\n'
